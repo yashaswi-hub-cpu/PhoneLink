@@ -19,19 +19,19 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 class FileServerService : Service() {
     companion object {
         @Volatile var running = false
         @Volatile var pin = ""
-        @Volatile var useTls = false
     }
 
     private var server: Server? = null
@@ -52,8 +52,9 @@ class FileServerService : Service() {
             .setContentText("Port $PORT")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentIntent(
-                PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-                    PendingIntent.FLAG_IMMUTABLE)
+                PendingIntent.getActivity(
+                    this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                )
             )
             .setOngoing(true)
             .build()
@@ -65,12 +66,12 @@ class FileServerService : Service() {
 
         if (server == null) {
             try {
+                Trust.pending.clear()
                 server = Server(applicationContext, pin).also { it.start(60000, false) }
                 wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "phonelink:srv").also { it.acquire() }
-                @Suppress("DEPRECATION")
                 wifi = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
-                    .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "phonelink").also { it.acquire() }
+                    .createWifiLock(wifiMode(), "phonelink").also { it.acquire() }
                 running = true
             } catch (e: Exception) {
                 running = false
@@ -79,6 +80,11 @@ class FileServerService : Service() {
         }
         return START_NOT_STICKY
     }
+
+    @Suppress("DEPRECATION")
+    private fun wifiMode(): Int =
+        if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        else WifiManager.WIFI_MODE_FULL_HIGH_PERF
 
     override fun onDestroy() {
         server?.stop()
@@ -98,60 +104,53 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
     @Volatile private var fails = 0
     @Volatile private var volCache: List<Pair<String, File>> = emptyList()
     @Volatile private var volAt = 0L
+    @Volatile private var lastSent = ""
+    @Volatile private var lastSentAt = 0L
+    private val tokens = ConcurrentHashMap<String, String>()   // login token -> phone name
+    private val nonces = ConcurrentHashMap<String, Long>()     // one-time challenges
     private val protRx = Regex("^/storage/[^/]+(/\\d+)?/Android/(data|obb)(/.*)?$")
     private val cmp = Comparator<Entry> { a, b ->
         if (a.d != b.d) (if (a.d) -1 else 1) else String.CASE_INSENSITIVE_ORDER.compare(a.n, b.n)
     }
 
-    override fun serve(session: IHTTPSession): Response {
-        val q = session.parameters
-        fun p(k: String): String = q[k]?.firstOrNull() ?: ""
+    private fun Map<String, List<String>>.p(k: String): String = this[k]?.firstOrNull() ?: ""
 
+    override fun serve(session: IHTTPSession): Response = try {
+        route(session, session.parameters)
+    } catch (e: SecurityException) {
+        msg(Status.FORBIDDEN, e.message ?: "denied")
+    } catch (e: Exception) {
+        msg(Status.INTERNAL_ERROR, e.message ?: "error")
+    }
+
+    private fun route(s: IHTTPSession, q: Map<String, List<String>>): Response {
+        // open endpoints: who am I / challenge
+        when (s.uri) {
+            "/hello" -> return json(
+                JSONObject().put("app", "phonelink").put("id", Store.deviceId(ctx))
+                    .put("name", Store.deviceName()).toString()
+            )
+            "/challenge" -> return challenge()
+        }
         if (fails >= 20) return msg(Status.FORBIDDEN, "Locked. Restart sharing.")
-
-        val pinOk = p("t") == pin && pin.isNotEmpty()
-
-        val tokenOk = run {
-            val raw = p("raw")
-            if (raw.isEmpty()) return@run false
-            val deviceId = p("d")
-            val ts = p("ts").toLongOrNull() ?: 0L
-            val sig = p("s")
-            Pairing.Server.verifySig(ctx, raw, deviceId, ts, p("path"), sig)
+        // login endpoints
+        when (s.uri) {
+            "/pair" -> return pair(q.p("t"), q.p("id"), q.p("name"), q.p("pk"))
+            "/auth" -> return auth(q.p("id"), q.p("nonce"), q.p("sig"))
         }
-
-        if (!pinOk && !tokenOk) {
+        // everything else needs the PIN or a login token of a paired phone
+        val t = q.p("t")
+        val who = if (t.isNotEmpty() && t == pin) "PIN" else tokens[t]
+        if (who == null) {
             fails++
-            return msg(Status.FORBIDDEN, if (p("t").isNotEmpty()) "Wrong PIN" else "Auth required")
+            return msg(Status.FORBIDDEN, "Wrong PIN")
         }
-
-        return try {
-            when (session.uri) {
-                "/list" -> {
-                    val r = list(p("path"))
-                    if (pinOk && !tokenOk) {
-                        val tok = Pairing.Server.issueToken(ctx, "client-${System.currentTimeMillis() % 100000}")
-                        r.addHeader("X-Pair-Token", tok)
-                    }
-                    r
-                }
-                "/file" -> serveFile(p("path"), session.headers["range"])
-                "/upload" -> upload(session, p("path"), p("name"),
-                    p("offset").toLongOrNull(), p("total").toLongOrNull())
-                "/devices" -> {
-                    if (!pinOk) return msg(Status.FORBIDDEN, "PIN required")
-                    msg(Status.OK, Pairing.Server.list(ctx).toString())
-                }
-                "/revoke" -> {
-                    if (!pinOk) return msg(Status.FORBIDDEN, "PIN required")
-                    val id = p("id")
-                    if (id.isEmpty()) Pairing.Server.revokeAll(ctx) else Pairing.Server.revoke(ctx, id)
-                    msg(Status.OK, "ok")
-                }
-                else -> msg(Status.NOT_FOUND, "Not found")
-            }
-        } catch (e: Exception) {
-            msg(Status.INTERNAL_ERROR, e.message ?: "error")
+        return when (s.uri) {
+            "/ping" -> msg(Status.OK, "ok")
+            "/list" -> list(q.p("path"))
+            "/file" -> serveFile(q.p("path"), s.headers["range"], who)
+            "/upload" -> upload(s, q.p("path"), q.p("name"), q.p("offset").toLongOrNull(), q.p("total").toLongOrNull(), who)
+            else -> msg(Status.NOT_FOUND, "Not found")
         }
     }
 
@@ -161,6 +160,97 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return r
     }
 
+    private fun json(s: String): Response = newFixedLengthResponse(Status.OK, "application/json", s)
+
+    private fun log(kind: String, name: String, peer: String = "", size: Long = 0L) {
+        History.add(ctx, kind, name, size, true, 0.0, peer, "")
+    }
+
+    // ---- pairing + login of remembered phones ----
+    private fun challenge(): Response {
+        val now = System.currentTimeMillis()
+        nonces.entries.removeIf { now - it.value > 30000L }
+        if (nonces.size > 200) nonces.clear()
+        val n = Crypto.rand(16)
+        nonces[n] = now
+        return msg(Status.OK, n)
+    }
+
+    private fun auth(id: String, nonce: String, sig: String): Response {
+        val at = nonces.remove(nonce)
+        if (at == null || System.currentTimeMillis() - at > 30000L) {
+            fails++
+            return msg(Status.FORBIDDEN, "Try again")
+        }
+        val dev = Trust.client(ctx, id)
+        if (dev == null) {
+            fails++
+            return msg(Status.FORBIDDEN, "This phone is not allowed here. Forget it and connect again with IP and PIN.")
+        }
+        val want = Crypto.hex(Crypto.hmac(dev.secret, "c|$nonce|$id"))
+        if (!Crypto.same(want, sig)) {
+            fails++
+            return msg(Status.FORBIDDEN, "Verification failed")
+        }
+        val token = Crypto.rand(16)
+        tokens[token] = dev.name
+        log("conn", dev.name)
+        val proof = Crypto.hex(Crypto.hmac(dev.secret, "s|$nonce|$token"))
+        return json(JSONObject().put("token", token).put("proof", proof).toString())
+    }
+
+    private fun pair(t: String, id: String, name: String, pk: String): Response {
+        if (t != pin) {
+            fails++
+            return msg(Status.FORBIDDEN, "Wrong PIN")
+        }
+        if (id.isEmpty() || pk.isEmpty()) return msg(Status.BAD_REQUEST, "bad request")
+        val clientKey = Crypto.unb64(pk)
+        val req = PairReq(id, name.take(40).ifEmpty { "Phone" })
+        Trust.pending.add(req)
+        notifyPair(req.name)
+        // the owner of THIS phone must tap Allow
+        val answered = try {
+            req.latch.await(60, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            false
+        }
+        Trust.pending.remove(req)
+        if (!answered || !req.ok) return msg(Status.FORBIDDEN, "Not allowed on the other phone")
+        val kp = Crypto.newKeyPair()
+        val secret = Crypto.agree(kp.private, clientKey)
+        Trust.addClient(ctx, id, req.name, secret)
+        log("pair", req.name)
+        return json(
+            JSONObject().put("sid", Store.deviceId(ctx)).put("sname", Store.deviceName())
+                .put("pk", Crypto.b64(kp.public.encoded)).toString()
+        )
+    }
+
+    private fun notifyPair(name: String) {
+        try {
+            val nm = ctx.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel("pair", "Pairing requests", NotificationManager.IMPORTANCE_HIGH)
+            )
+            val pi = PendingIntent.getActivity(
+                ctx, 2,
+                Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val n = Notification.Builder(ctx, "pair")
+                .setContentTitle("Allow $name?")
+                .setContentText("It wants to connect without IP and PIN. Tap to answer.")
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(2, n)
+        } catch (e: Exception) {
+        }
+    }
+
+    // ---- storage volumes (internal + SD card) ----
     private fun volumes(): List<Pair<String, File>> {
         val now = System.currentTimeMillis()
         if (now - volAt < 5000 && volCache.isNotEmpty()) return volCache
@@ -179,6 +269,7 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return out
     }
 
+    /** null = virtual root (list of volumes) */
     private fun resolve(rel: String): File? {
         val clean = rel.trim('/')
         if (clean.isEmpty()) return null
@@ -192,12 +283,12 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return f
     }
 
-    private fun isProtected(f: File): Boolean =
-        Build.VERSION.SDK_INT >= 30 && protRx.matches(f.path)
+    // ---- Android/data and Android/obb go through Shizuku ----
+    private fun isProtected(f: File): Boolean = Build.VERSION.SDK_INT >= 30 && protRx.matches(f.path)
 
     private fun needShizuku() {
         if (!ShizukuBridge.ready())
-            throw IllegalStateException("Android/data needs Shizuku: start Shizuku and tap 'Enable Android/data'")
+            throw IllegalStateException("Android/data needs Shizuku: start Shizuku and tap 'Enable Android/data' on that phone")
     }
 
     private fun fileLen(f: File, prot: Boolean): Long {
@@ -209,8 +300,7 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
     }
 
     private fun openIn(f: File, prot: Boolean): FileInputStream =
-        if (prot) ParcelFileDescriptor.AutoCloseInputStream(ShizukuBridge.openRead(f.path))
-        else FileInputStream(f)
+        if (prot) ParcelFileDescriptor.AutoCloseInputStream(ShizukuBridge.openRead(f.path)) else FileInputStream(f)
 
     private fun entries(f: File): List<Entry> {
         if (isProtected(f)) {
@@ -222,7 +312,10 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
             }
         }
         val files = f.listFiles() ?: return emptyList()
-        return files.map { val d = it.isDirectory; Entry(it.name, d, if (d) 0L else it.length()) }
+        return files.map {
+            val d = it.isDirectory
+            Entry(it.name, d, if (d) 0L else it.length())
+        }
     }
 
     private fun list(rel: String): Response {
@@ -233,7 +326,16 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return newFixedLengthResponse(Status.OK, "application/json", arr.toString())
     }
 
-    private fun serveFile(rel: String, range: String?): Response {
+    private fun logSent(name: String, who: String, size: Long) {
+        val key = "$who|$name"
+        val now = System.currentTimeMillis()
+        if (key == lastSent && now - lastSentAt < 15000L) return
+        lastSent = key
+        lastSentAt = now
+        log("sent", name, who, size)
+    }
+
+    private fun serveFile(rel: String, range: String?, who: String): Response {
         val f = resolve(rel) ?: return msg(Status.NOT_FOUND, "No such file")
         val prot = isProtected(f)
         if (prot) needShizuku()
@@ -263,10 +365,15 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
             return r
         }
         val ins = openIn(f, prot)
-        try { ins.channel.position(start) } catch (e: Exception) { ins.close(); throw e }
-        val buffered = BufferedInputStream(ins, 1 shl 20)
+        try {
+            ins.channel.position(start)
+        } catch (e: Exception) {
+            ins.close()
+            throw e
+        }
+        if (start == 0L) logSent(f.name, who, len)
         val res = newFixedLengthResponse(
-            if (partial) Status.PARTIAL_CONTENT else Status.OK, mime, buffered, end - start + 1
+            if (partial) Status.PARTIAL_CONTENT else Status.OK, mime, ins, end - start + 1
         )
         res.addHeader("Accept-Ranges", "bytes")
         if (partial) res.addHeader("Content-Range", "bytes $start-$end/$len")
@@ -285,7 +392,7 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return left
     }
 
-    private fun upload(s: IHTTPSession, rel: String, name: String, off: Long?, total: Long?): Response {
+    private fun upload(s: IHTTPSession, rel: String, name: String, off: Long?, total: Long?, who: String): Response {
         val safe = File(name).name
         if (safe.isEmpty() || safe == "." || safe == "..") return msg(Status.BAD_REQUEST, "name")
         val len = s.headers["content-length"]?.toLongOrNull() ?: return msg(Status.BAD_REQUEST, "length")
@@ -309,6 +416,8 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
             }
         }
         if (left > 0) return msg(Status.BAD_REQUEST, "incomplete")
+        if (off == null) log("recv", safe, who, len)
+        else if (total != null && off + len >= total) log("recv", safe, who, total)
         return msg(Status.OK, "ok")
     }
 }

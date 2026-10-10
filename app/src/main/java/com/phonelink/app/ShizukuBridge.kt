@@ -13,6 +13,7 @@ import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
+/** Runs inside the Shizuku process (shell uid). Can read /Android/data and /Android/obb. */
 class UserService() : IUserService.Stub() {
     constructor(context: Context) : this()
 
@@ -61,6 +62,7 @@ class UserService() : IUserService.Stub() {
     }
 }
 
+/** App side: connects to the UserService through Shizuku. */
 object ShizukuBridge {
     @Volatile private var svc: IUserService? = null
     @Volatile private var latch = CountDownLatch(1)

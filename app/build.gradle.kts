@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 3
-        versionName = "1.2"
+        versionName = "2.0"
     }
     buildFeatures { aidl = true }
     buildTypes {
@@ -32,5 +32,4 @@ dependencies {
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }

@@ -18,10 +18,13 @@ import java.net.URL
 class PlayerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Lan.start(applicationContext)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val url = intent.getStringExtra("url") ?: return finish()
         val name = intent.getStringExtra("name") ?: ""
         title = name
+        val remote = url.startsWith("http")
+        if (remote) Lan.bindProcess(Uri.parse(url).host)
 
         if (extOf(name) in IMAGE) {
             val iv = ImageView(this)
@@ -30,7 +33,8 @@ class PlayerActivity : Activity() {
             setContentView(iv)
             Thread {
                 try {
-                    val bytes = URL(url).openStream().use { it.readBytes() }
+                    val ins = if (remote) Lan.open(URL(url)).getInputStream() else URL(url).openStream()
+                    val bytes = ins.use { it.readBytes() }
                     val o = BitmapFactory.Options()
                     o.inJustDecodeBounds = true
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
@@ -65,5 +69,10 @@ class PlayerActivity : Activity() {
             }
             vv.setVideoURI(Uri.parse(url))
         }
+    }
+
+    override fun onDestroy() {
+        Lan.bindProcess(null)
+        super.onDestroy()
     }
 }
