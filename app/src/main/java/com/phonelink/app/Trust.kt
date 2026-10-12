@@ -8,7 +8,7 @@ import java.util.concurrent.CountDownLatch
 /** A phone asking (on the sharing phone) to be remembered. Waits for the owner to tap Allow / Deny. */
 class PairReq(val id: String, val name: String) {
     val latch = CountDownLatch(1)
-    @Volatile var ok = false
+    @Volatile var mode = 0   // 0 = denied / no answer, 1 = always, 2 = until sharing stops
 }
 
 object Trust {

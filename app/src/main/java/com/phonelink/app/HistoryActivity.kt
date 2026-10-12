@@ -10,6 +10,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -82,18 +83,28 @@ class HistoryActivity : Activity() {
     private fun pick(i: Int) {
         val r = recs[i]
         val e = extOf(r.name)
-        val canOpen = r.path.isNotEmpty() && File(r.path).exists() && (e in VIDEO || e in AUDIO || e in IMAGE)
-        val opts = if (canOpen) arrayOf("Open", "Remove from list") else arrayOf("Remove from list")
-        AlertDialog.Builder(this).setTitle(r.name).setItems(opts) { _, w ->
-            if (canOpen && w == 0) {
-                startActivity(
+        val exists = r.path.isNotEmpty() && File(r.path).exists()
+        val media = e in VIDEO || e in AUDIO || e in IMAGE
+        val opts = ArrayList<String>()
+        if (exists) opts.add("Open with...")
+        if (exists && media) opts.add("Play here")
+        opts.add("Remove from list")
+        AlertDialog.Builder(this).setTitle(r.name).setItems(opts.toTypedArray()) { _, w ->
+            when (opts[w]) {
+                "Open with..." -> try {
+                    Opener.openFile(this, File(r.path), r.name)
+                } catch (ex: Exception) {
+                    Toast.makeText(this, "No app can open this", Toast.LENGTH_SHORT).show()
+                }
+                "Play here" -> startActivity(
                     Intent(this, PlayerActivity::class.java)
                         .putExtra("url", Uri.fromFile(File(r.path)).toString())
                         .putExtra("name", r.name)
                 )
-            } else {
-                History.remove(this, i)
-                reload()
+                else -> {
+                    History.remove(this, i)
+                    reload()
+                }
             }
         }.show()
     }

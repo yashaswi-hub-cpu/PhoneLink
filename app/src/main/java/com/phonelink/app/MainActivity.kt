@@ -3,10 +3,12 @@ package com.phonelink.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -24,6 +26,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import rikka.shizuku.Shizuku
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -48,6 +51,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Lan.start(applicationContext)
+        try {
+            File(cacheDir, "open").deleteRecursively()
+        } catch (e: Exception) {
+        }
         title = "PhoneLink"
         val prefs = getSharedPreferences("p", MODE_PRIVATE)
         val pad = dp(16)
@@ -107,8 +114,15 @@ class MainActivity : Activity() {
         val hist = Button(this)
         hist.text = "History"
         hist.setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
+        val clr = Button(this)
+        clr.text = "Clear offline copies"
+        clr.setOnClickListener {
+            Offline.clear(this)
+            say("Offline copies cleared")
+        }
         col.addView(head("History"))
         col.addView(hist)
+        col.addView(clr)
 
         val sv = ScrollView(this)
         sv.addView(col)
@@ -137,21 +151,34 @@ class MainActivity : Activity() {
         asking = true
         AlertDialog.Builder(this)
             .setTitle("Allow this phone?")
-            .setMessage("${r.name} wants to connect without IP and PIN next time.\n\nAllow only your own phone.")
+            .setMessage(
+                "${r.name} wants to connect without IP and PIN.\n\n" +
+                    "Always: remembered until you remove it.\n" +
+                    "Until I stop sharing: forgotten when sharing stops.\n\nAllow only your own phone."
+            )
             .setCancelable(false)
-            .setPositiveButton("Allow") { _, _ ->
-                r.ok = true
-                Trust.pending.remove(r)
-                r.latch.countDown()
-                asking = false
-                refresh()
-            }
-            .setNegativeButton("Deny") { _, _ ->
-                Trust.pending.remove(r)
-                r.latch.countDown()
-                asking = false
-            }
+            .setPositiveButton("Always") { _, _ -> answer(r, 1) }
+            .setNeutralButton("Until I stop sharing") { _, _ -> answer(r, 2) }
+            .setNegativeButton("Deny") { _, _ -> answer(r, 0) }
             .show()
+    }
+
+    private fun answer(r: PairReq, mode: Int) {
+        r.mode = mode
+        Trust.pending.remove(r)
+        r.latch.countDown()
+        asking = false
+        refresh()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wifiInfo(): String = try {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val i = wm.connectionInfo
+        if (i == null || i.networkId == -1) "Wi-Fi: not a Wi-Fi client (hotspot or off)"
+        else "Wi-Fi: " + (if (i.frequency > 4900) "5 GHz" else "2.4 GHz") + ", link " + i.linkSpeed + " Mbps"
+    } catch (e: Exception) {
+        ""
     }
 
     // ---------- connecting ----------
@@ -222,6 +249,14 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    /** Browse the folders last seen on that phone, with no connection. */
+    private fun openOffline(d: Trust.Dev) {
+        startActivity(
+            Intent(this, BrowserActivity::class.java)
+                .putExtra("offline", true).putExtra("sid", d.id).putExtra("sname", d.name).putExtra("host", d.ip)
+        )
+    }
+
     // ---------- list rows ----------
     private fun label(t: String) = TextView(this).also {
         it.text = t; it.textSize = 14f; it.setPadding(0, dp(6), 0, dp(2))
@@ -229,18 +264,21 @@ class MainActivity : Activity() {
 
     private fun row(text: String, vararg btns: Pair<String, () -> Unit>): LinearLayout {
         val r = LinearLayout(this)
-        r.orientation = LinearLayout.HORIZONTAL
-        r.gravity = Gravity.CENTER_VERTICAL
+        r.orientation = LinearLayout.VERTICAL
+        r.setPadding(0, dp(4), 0, dp(4))
         val t = TextView(this)
         t.text = text
         t.textSize = 16f
-        r.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        r.addView(t)
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
         for ((name, fn) in btns) {
             val b = Button(this)
             b.text = name
             b.setOnClickListener { fn() }
-            r.addView(b)
+            bar.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
+        r.addView(bar)
         return r
     }
 
@@ -311,7 +349,7 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
-        val me = "Phone: ${Store.deviceName()}\n"
+        val me = "Phone: ${Store.deviceName()}\n${wifiInfo()}\n"
         if (FileServerService.running) {
             toggle.text = "Stop sharing"
             info.text = me + "ON\nPIN: ${FileServerService.pin}\nAndroid/data (Shizuku): " +
@@ -343,6 +381,7 @@ class MainActivity : Activity() {
                     row(
                         d.name,
                         "Connect" to { connectSaved(d) },
+                        "Offline" to { openOffline(d) },
                         "Forget" to { Trust.removeServer(this, d.id); refresh() }
                     )
                 )

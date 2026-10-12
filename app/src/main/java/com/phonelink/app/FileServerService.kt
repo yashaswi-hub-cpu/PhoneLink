@@ -19,6 +19,7 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -108,6 +109,9 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
     @Volatile private var lastSentAt = 0L
     private val tokens = ConcurrentHashMap<String, String>()   // login token -> phone name
     private val nonces = ConcurrentHashMap<String, Long>()     // one-time challenges
+    private val temp = ConcurrentHashMap<String, Trust.Dev>()  // phones allowed only until sharing stops
+
+    private fun trusted(id: String): Trust.Dev? = Trust.client(ctx, id) ?: temp[id]
     private val protRx = Regex("^/storage/[^/]+(/\\d+)?/Android/(data|obb)(/.*)?$")
     private val cmp = Comparator<Entry> { a, b ->
         if (a.d != b.d) (if (a.d) -1 else 1) else String.CASE_INSENSITIVE_ORDER.compare(a.n, b.n)
@@ -148,6 +152,10 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         return when (s.uri) {
             "/ping" -> msg(Status.OK, "ok")
             "/list" -> list(q.p("path"))
+            "/speed" -> {
+                val len = (q.p("mb").toLongOrNull() ?: 64L).coerceIn(1L, 1024L) shl 20
+                newFixedLengthResponse(Status.OK, "application/octet-stream", ZeroStream(len), len)
+            }
             "/file" -> serveFile(q.p("path"), s.headers["range"], who)
             "/upload" -> upload(s, q.p("path"), q.p("name"), q.p("offset").toLongOrNull(), q.p("total").toLongOrNull(), who)
             else -> msg(Status.NOT_FOUND, "Not found")
@@ -182,7 +190,7 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
             fails++
             return msg(Status.FORBIDDEN, "Try again")
         }
-        val dev = Trust.client(ctx, id)
+        val dev = trusted(id)
         if (dev == null) {
             fails++
             return msg(Status.FORBIDDEN, "This phone is not allowed here. Forget it and connect again with IP and PIN.")
@@ -206,21 +214,32 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         }
         if (id.isEmpty() || pk.isEmpty()) return msg(Status.BAD_REQUEST, "bad request")
         val clientKey = Crypto.unb64(pk)
-        val req = PairReq(id, name.take(40).ifEmpty { "Phone" })
-        Trust.pending.add(req)
-        notifyPair(req.name)
-        // the owner of THIS phone must tap Allow
-        val answered = try {
-            req.latch.await(60, TimeUnit.SECONDS)
-        } catch (e: InterruptedException) {
-            false
+        val pname = name.take(40).ifEmpty { "Phone" }
+        // already allowed (always, or until sharing stops): the PIN is enough, no new question
+        var mode = if (Trust.client(ctx, id) != null) 1 else if (temp.containsKey(id)) 2 else 0
+        val isNew = mode == 0
+        if (isNew) {
+            // the owner of THIS phone must answer
+            val req = PairReq(id, pname)
+            Trust.pending.add(req)
+            notifyPair(pname)
+            try {
+                req.latch.await(60, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+            }
+            Trust.pending.remove(req)
+            mode = req.mode
+            if (mode == 0) return msg(Status.FORBIDDEN, "Not allowed on the other phone")
         }
-        Trust.pending.remove(req)
-        if (!answered || !req.ok) return msg(Status.FORBIDDEN, "Not allowed on the other phone")
         val kp = Crypto.newKeyPair()
         val secret = Crypto.agree(kp.private, clientKey)
-        Trust.addClient(ctx, id, req.name, secret)
-        log("pair", req.name)
+        if (mode == 1) {
+            Trust.addClient(ctx, id, pname, secret)
+            temp.remove(id)
+        } else {
+            temp[id] = Trust.Dev(id, pname, secret, "")
+        }
+        if (isNew) log("pair", pname)
         return json(
             JSONObject().put("sid", Store.deviceId(ctx)).put("sname", Store.deviceName())
                 .put("pk", Crypto.b64(kp.public.encoded)).toString()
@@ -364,13 +383,15 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
             r.addHeader("Content-Range", "bytes */$len")
             return r
         }
-        val ins = openIn(f, prot)
+        val raw = openIn(f, prot)
         try {
-            ins.channel.position(start)
+            raw.channel.position(start)
         } catch (e: Exception) {
-            ins.close()
+            raw.close()
             throw e
         }
+        // read the storage in 1 MB pieces (not 16 KB): far fewer slow storage calls
+        val ins = BufferedInputStream(raw, 1 shl 20)
         if (start == 0L) logSent(f.name, who, len)
         val res = newFixedLengthResponse(
             if (partial) Status.PARTIAL_CONTENT else Status.OK, mime, ins, end - start + 1
@@ -419,5 +440,22 @@ class Server(private val ctx: Context, private val pin: String) : NanoHTTPD(PORT
         if (off == null) log("recv", safe, who, len)
         else if (total != null && off + len >= total) log("recv", safe, who, total)
         return msg(Status.OK, "ok")
+    }
+}
+
+/** Endless zeros: used by the network speed test (no storage involved). */
+private class ZeroStream(private var left: Long) : InputStream() {
+    override fun read(): Int {
+        if (left <= 0L) return -1
+        left--
+        return 0
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (left <= 0L) return -1
+        val n = minOf(len.toLong(), left).toInt()
+        java.util.Arrays.fill(b, off, off + n, 0.toByte())
+        left -= n
+        return n
     }
 }

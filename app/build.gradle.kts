@@ -11,14 +11,23 @@ android {
         applicationId = "com.phonelink.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.0"
+        versionCode = 4
+        versionName = "2.1"
     }
     buildFeatures { aidl = true }
+    // Same key on every build, so a new APK installs over the old app and keeps its saved phones.
+    signingConfigs {
+        create("phonelink") {
+            storeFile = file("phonelink.jks")
+            storePassword = "phonelink"
+            keyAlias = "phonelink"
+            keyPassword = "phonelink"
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("phonelink")
         }
     }
     compileOptions {
@@ -32,4 +41,5 @@ dependencies {
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("androidx.core:core:1.12.0")
 }

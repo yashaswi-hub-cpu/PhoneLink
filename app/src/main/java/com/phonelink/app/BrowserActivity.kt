@@ -28,6 +28,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -47,6 +50,7 @@ class BrowserActivity : Activity() {
     @Volatile private var token = ""      // PIN, or the login token of a paired phone
     private var sid = ""                  // id of the paired phone ("" = connected with PIN only)
     private var sname = ""
+    private var offline = false           // browsing saved copies only, no connection
     private var path = ""
     private var want = ""
     private var shown: String? = null
@@ -68,6 +72,7 @@ class BrowserActivity : Activity() {
         token = intent.getStringExtra("pin") ?: ""
         sid = intent.getStringExtra("sid") ?: ""
         sname = intent.getStringExtra("sname") ?: host
+        offline = intent.getBooleanExtra("offline", false)
         title = if (sname.isEmpty()) host else sname
 
         val col = LinearLayout(this)
@@ -79,21 +84,29 @@ class BrowserActivity : Activity() {
         status = TextView(this)
         status.textSize = 13f
         status.setPadding(dp(12), 0, dp(12), dp(6))
-        status.text = "Connecting..."
+        status.text = if (offline) "Offline - saved copy" else "Connecting..."
 
         val back = Button(this)
         back.text = "Back"
         back.setOnClickListener { goUp() }
         val send = Button(this)
         send.text = "Send file here"
+        send.isEnabled = !offline
         send.setOnClickListener { pickFiles() }
         val hist = Button(this)
         hist.text = "History"
         hist.setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
-        val bar = LinearLayout(this)
-        bar.addView(back, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(send, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f))
-        bar.addView(hist, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val speed = Button(this)
+        speed.text = "Speed test"
+        speed.isEnabled = !offline
+        speed.setOnClickListener { speedTest() }
+
+        val bar1 = LinearLayout(this)
+        bar1.addView(back, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar1.addView(send, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val bar2 = LinearLayout(this)
+        bar2.addView(hist, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar2.addView(speed, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         ad = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
         lv = ListView(this)
@@ -103,7 +116,8 @@ class BrowserActivity : Activity() {
 
         col.addView(pathView)
         col.addView(status)
-        col.addView(bar)
+        col.addView(bar1)
+        col.addView(bar2)
         col.addView(lv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(col)
         load("")
@@ -178,7 +192,21 @@ class BrowserActivity : Activity() {
         throw last ?: IOException("failed")
     }
 
-    // ---- browsing (cached: instant back/forward, refreshed in background) ----
+    // ---- browsing: memory cache + saved copy on disk (works with no connection) ----
+    private fun cacheKey(): String = if (sid.isNotEmpty()) sid else host
+
+    private fun fmtDate(t: Long): String = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date(t))
+
+    private fun parseItems(txt: String): List<Item> {
+        val arr = JSONArray(txt)
+        val out = ArrayList<Item>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            out.add(Item(o.getString("n"), o.getBoolean("d"), o.getLong("s")))
+        }
+        return out
+    }
+
     private fun show(p: String, list: List<Item>) {
         items = list
         path = p
@@ -191,30 +219,48 @@ class BrowserActivity : Activity() {
         shown = p
     }
 
+    /** Shows the saved copy of a folder. Returns false if this folder was never saved. */
+    private fun showSaved(p: String, note: String): Boolean {
+        val saved = Offline.load(applicationContext, cacheKey(), p) ?: return false
+        val list = parseItems(saved.second)
+        runOnUiThread {
+            if (want == p) show(p, list)
+            status.text = "$note - saved copy from ${fmtDate(saved.first)}"
+        }
+        return true
+    }
+
     private fun load(p: String) {
         want = p
         cache[p]?.let { show(p, it) }
+        if (offline) {
+            if (!showSaved(p, "Offline")) {
+                toast("Not saved yet. Open this folder once while connected.")
+                if (shown == null) show(p, emptyList())
+            }
+            return
+        }
         pool.execute {
             try {
-                val res = retry(3) {
+                val txt = retry(3) {
                     val c = conn("list", p)
                     if (c.responseCode != 200) fail(c)
-                    val arr = JSONArray(c.inputStream.bufferedReader().use { it.readText() })
-                    val out = ArrayList<Item>(arr.length())
-                    for (i in 0 until arr.length()) {
-                        val o = arr.getJSONObject(i)
-                        out.add(Item(o.getString("n"), o.getBoolean("d"), o.getLong("s")))
-                    }
-                    out
+                    c.inputStream.bufferedReader().use { it.readText() }
                 }
+                val res = parseItems(txt)
                 cache[p] = res
+                Offline.save(applicationContext, cacheKey(), p, txt)
                 runOnUiThread {
                     if (want == p) show(p, res)
                     status.text = "Connected"
                 }
             } catch (e: Exception) {
-                setStatus("Not connected")
-                toast("Failed: ${e.message}")
+                if (showSaved(p, "Not connected")) {
+                    toast("Not connected - showing saved copy")
+                } else {
+                    setStatus("Not connected")
+                    toast("Failed: ${e.message}")
+                }
             }
         }
     }
@@ -232,19 +278,65 @@ class BrowserActivity : Activity() {
             load(rel)
             return
         }
+        if (offline) {
+            toast("Offline: connect to open or download this file")
+            return
+        }
         val e = extOf(item.name)
         val canView = e in VIDEO || e in AUDIO || e in IMAGE
-        val opts = if (canView) arrayOf("Play / View", "Download") else arrayOf("Download")
-        AlertDialog.Builder(this).setTitle(item.name).setItems(opts) { _, w ->
-            if (canView && w == 0) {
-                History.add(applicationContext, "play", item.name, item.size, true, 0.0, sname, "")
-                startActivity(
-                    Intent(this, PlayerActivity::class.java)
-                        .putExtra("url", Net.url(host, "file", rel, token))
-                        .putExtra("name", item.name)
-                )
-            } else download(rel, item.name, item.size)
+        val labels = ArrayList<String>()
+        labels.add("Open with...")
+        if (canView) labels.add("Play / View here")
+        labels.add("Download")
+        AlertDialog.Builder(this).setTitle(item.name).setItems(labels.toTypedArray()) { _, w ->
+            when (labels[w]) {
+                "Open with..." -> openWith(rel, item)
+                "Play / View here" -> {
+                    History.add(applicationContext, "play", item.name, item.size, true, 0.0, sname, "")
+                    startActivity(
+                        Intent(this, PlayerActivity::class.java)
+                            .putExtra("url", Net.url(host, "file", rel, token))
+                            .putExtra("name", item.name)
+                    )
+                }
+                else -> download(rel, item.name, item.size)
+            }
         }.show()
+    }
+
+    /** Lets the user pick the app. Video / audio stream straight into it; other types are fetched first. */
+    private fun openWith(rel: String, item: Item) {
+        History.add(applicationContext, "play", item.name, item.size, true, 0.0, sname, "")
+        val e = extOf(item.name)
+        if (e in VIDEO || e in AUDIO) {
+            try {
+                Opener.openUrl(this, Net.url(host, "file", rel, token), item.name)
+            } catch (ex: Exception) {
+                toast("No app can open this")
+            }
+            return
+        }
+        pool.execute {
+            val dir = File(cacheDir, "open")
+            dir.mkdirs()
+            val f = File(dir, item.name)
+            try {
+                f.delete()
+                fetchTo(rel, item.size, f, "Opening ${item.name}")
+                setStatus("Ready: ${item.name}")
+                runOnUiThread {
+                    try {
+                        Opener.openFile(this, f, item.name)
+                    } catch (ex: Exception) {
+                        toast("No app can open this")
+                    }
+                }
+            } catch (ex: Exception) {
+                f.delete()
+                setStatus("Failed")
+                toast("Failed: ${ex.message}")
+            }
+        }
     }
 
     // ---- fast transfers: many parallel connections, work-queue of blocks, auto-retry ----
@@ -306,35 +398,40 @@ class BrowserActivity : Activity() {
         err.get()?.let { throw it }
     }
 
+    /** Downloads a whole remote file into [t]. Returns the average MB/s. */
+    private fun fetchTo(rel: String, size: Long, t: File, label: String): Double {
+        val t0 = System.nanoTime()
+        val done = AtomicLong(0)
+        locked {
+            if (size == 0L) {
+                t.createNewFile()
+            } else {
+                RandomAccessFile(t, "rw").use { raf ->
+                    raf.setLength(size)
+                    val ch = raf.channel
+                    val blocks = ((size + BLOCK - 1) / BLOCK).toInt()
+                    transfer(minOf(WORKERS, blocks), blocks, label, size, done, t0) { b, abort ->
+                        val s = b * BLOCK
+                        fetchRange(rel, s, minOf(size - 1, s + BLOCK - 1), ch, done, abort)
+                    }
+                }
+            }
+        }
+        return mbps(done.get(), t0)
+    }
+
     private fun download(rel: String, name: String, size: Long) {
         pool.execute {
             var target: File? = null
-            val t0 = System.nanoTime()
-            val done = AtomicLong(0)
             try {
-                locked {
-                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    dir.mkdirs()
-                    var t = File(dir, name)
-                    if (t.exists()) t = File(dir, "${System.currentTimeMillis()}_$name")
-                    target = t
-                    if (size == 0L) {
-                        t.createNewFile()
-                    } else {
-                        RandomAccessFile(t, "rw").use { raf ->
-                            raf.setLength(size)
-                            val ch = raf.channel
-                            val blocks = ((size + BLOCK - 1) / BLOCK).toInt()
-                            transfer(minOf(WORKERS, blocks), blocks, "Down $name", size, done, t0) { b, abort ->
-                                val s = b * BLOCK
-                                fetchRange(rel, s, minOf(size - 1, s + BLOCK - 1), ch, done, abort)
-                            }
-                        }
-                    }
-                }
-                val sp = mbps(done.get(), t0)
-                setStatus("Saved Downloads/${target?.name}  avg ${fmtSpeed(sp)}")
-                History.add(applicationContext, "down", name, size, true, sp, sname, target?.absolutePath ?: "")
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs()
+                var t = File(dir, name)
+                if (t.exists()) t = File(dir, "${System.currentTimeMillis()}_$name")
+                target = t
+                val sp = fetchTo(rel, size, t, "Down $name")
+                setStatus("Saved Downloads/${t.name}  avg ${fmtSpeed(sp)}")
+                History.add(applicationContext, "down", name, size, true, sp, sname, t.absolutePath)
             } catch (e: Exception) {
                 target?.delete()
                 setStatus("Download failed")
@@ -344,33 +441,34 @@ class BrowserActivity : Activity() {
         }
     }
 
-    /** Downloads bytes s..e into the file. Survives dropped connections: continues from where it stopped. */
+    /**
+     * Downloads bytes s..e. The block is collected in memory and written to storage in ONE big write
+     * (many tiny writes are very slow on phone storage). Survives dropped connections.
+     */
     private fun fetchRange(rel: String, s: Long, e: Long, ch: FileChannel, done: AtomicLong, abort: AtomicBoolean) {
-        var pos = s
+        val len = (e - s + 1).toInt()
+        val buf = ByteArray(len)
+        var got = 0
         var tries = 0
-        val buf = ByteArray(1 shl 20)
-        while (pos <= e) {
+        while (got < len) {
             if (abort.get()) throw IOException("cancelled")
-            val before = pos
+            val before = got
             val t = token
             try {
                 val c = conn("file", rel)
-                c.setRequestProperty("Range", "bytes=$pos-$e")
+                c.setRequestProperty("Range", "bytes=${s + got}-$e")
                 if (c.responseCode != 206) fail(c)
                 c.inputStream.use { ins ->
-                    while (pos <= e) {
-                        val n = ins.read(buf, 0, minOf(buf.size.toLong(), e - pos + 1).toInt())
+                    while (got < len) {
+                        val n = ins.read(buf, got, len - got)
                         if (n < 0) break
-                        val bb = ByteBuffer.wrap(buf, 0, n)
-                        var p = pos
-                        while (bb.hasRemaining()) p += ch.write(bb, p)
-                        pos += n
+                        got += n
                         done.addAndGet(n.toLong())
                     }
                 }
-                if (pos <= e) throw IOException("Connection dropped")
+                if (got < len) throw IOException("Connection dropped")
             } catch (ex: IOException) {
-                if (pos > before) tries = 0
+                if (got > before) tries = 0
                 if (++tries > 8 || abort.get()) throw ex
                 try {
                     Thread.sleep(minOf(3000L, 300L * tries))
@@ -378,6 +476,54 @@ class BrowserActivity : Activity() {
                     throw ex
                 }
                 if (ex is AuthException || tries >= 2) reconnect(t)
+            }
+        }
+        val bb = ByteBuffer.wrap(buf, 0, len)
+        var p = s
+        while (bb.hasRemaining()) p += ch.write(bb, p)
+    }
+
+    /** Pure network speed (no storage on either phone): shows whether Wi-Fi or storage is the limit. */
+    private fun speedTest() {
+        setStatus("Testing network speed...")
+        pool.execute {
+            val total = AtomicLong(0)
+            val stop = AtomicBoolean(false)
+            val bad = AtomicReference<Exception?>(null)
+            val latch = CountDownLatch(4)
+            val t0 = System.nanoTime()
+            for (i in 0 until 4) {
+                pool.execute {
+                    try {
+                        val c = conn("speed", "", "&mb=512")
+                        if (c.responseCode != 200) fail(c)
+                        val buf = ByteArray(1 shl 18)
+                        c.inputStream.use { ins ->
+                            while (!stop.get()) {
+                                val n = ins.read(buf)
+                                if (n < 0) break
+                                total.addAndGet(n.toLong())
+                            }
+                        }
+                    } catch (ex: Exception) {
+                        bad.compareAndSet(null, ex)
+                    } finally {
+                        latch.countDown()
+                    }
+                }
+            }
+            try {
+                Thread.sleep(6000)
+            } catch (ie: InterruptedException) {
+            }
+            stop.set(true)
+            val r = mbps(total.get(), t0)
+            latch.await(3, TimeUnit.SECONDS)
+            if (total.get() == 0L) {
+                setStatus("Speed test failed")
+                toast("Speed test failed: ${bad.get()?.message}")
+            } else {
+                setStatus("Network speed: ${fmtSpeed(r)}  (4 streams, 6 s)")
             }
         }
     }
